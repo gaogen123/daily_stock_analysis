@@ -23,10 +23,11 @@ def _market_data(stale_count=0, invalid_count=0):
 
 
 class SnapshotTests(unittest.TestCase):
-    def _run(self, data, target="2026-11-12"):
+    def _run(self, data, target="2026-11-12", invalid_caps=()):
         class FakeTicker:
             def __init__(self, ticker):
-                self.fast_info = types.SimpleNamespace(market_cap=10_000_000, shares=1_000_000)
+                cap = float("nan") if ticker in invalid_caps else 10_000_000
+                self.fast_info = types.SimpleNamespace(market_cap=cap, shares=1_000_000)
 
         fake_yf = types.SimpleNamespace(download=lambda *args, **kwargs: data, Ticker=FakeTicker)
         with patch.dict(sys.modules, {"yfinance": fake_yf}), \
@@ -42,6 +43,22 @@ class SnapshotTests(unittest.TestCase):
     def test_stale_and_invalid_prices_do_not_count_toward_coverage(self):
         with self.assertRaisesRegex(RuntimeError, "below 80%"):
             self._run(_market_data(stale_count=1, invalid_count=1))
+
+    def test_nonfinite_market_caps_do_not_count_toward_coverage(self):
+        with self.assertRaisesRegex(RuntimeError, "below 80%"):
+            self._run(_market_data(), invalid_caps=("AAA", "BBB"))
+
+    def test_incomplete_sp500_does_not_masquerade_as_valid_universe(self):
+        fake_yf = types.SimpleNamespace()
+        def universe(source):
+            if source == "sp500":
+                return ["AAA"]
+            raise RuntimeError("source unavailable")
+        with patch.dict(sys.modules, {"yfinance": fake_yf}), \
+             patch.dict(snapshot_us.os.environ, {"SCREENING_US_TARGET_DATE": "2026-11-12"}), \
+             patch.object(snapshot_us, "fetch_us_universe", side_effect=universe):
+            with self.assertRaisesRegex(RuntimeError, "US universe is empty"):
+                snapshot_us.fetch_us_snapshot()
 
 
 if __name__ == "__main__":

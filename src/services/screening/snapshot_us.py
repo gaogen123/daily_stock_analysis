@@ -106,6 +106,7 @@ def fetch_us_snapshot(
                         actual_universe_source = source
                         break
                 except Exception as exc:
+                    tickers = None
                     logger.warning("US universe %s unavailable: %s", source, exc)
         else:
             tickers = fetch_us_universe(universe_source)
