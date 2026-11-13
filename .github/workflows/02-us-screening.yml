@@ -1,0 +1,52 @@
+name: 美股自动选股与邮件报告
+
+on:
+  schedule:
+    - cron: '30 22 * * 1-5' # 美国周一至周五收盘后；北京时间周二至周六 06:30
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 以最近已收盘的美股交易日运行一次
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automatic-us-screening
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Yahoo snapshot's end date is exclusive; Shanghai time includes the US session.
+      TZ: Asia/Shanghai
+      SCREENING_ENABLED: 'true'
+      SCREENING_MARKET: us
+      SCREENING_FORCE_RUN: ${{ inputs.force_run || 'false' }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 美股选股并发送邮件
+        run: python scripts/automatic_screening.py
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: us-screening-reports-${{ github.run_number }}
+          path: reports/screening_us_*.md
+          if-no-files-found: ignore
+          retention-days: 30

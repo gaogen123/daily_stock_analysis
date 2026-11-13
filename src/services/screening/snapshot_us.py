@@ -12,8 +12,10 @@ rather than silently screening the US pool.
 """
 
 import logging
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 import pandas as pd
 
 from src.core.trading_calendar import MARKET_TIMEZONE
@@ -89,8 +91,28 @@ def fetch_us_snapshot(
     """
     import yfinance as yf
 
+    # Scheduled reports must not rank quotes from a different US trading day.
+    target_raw = os.getenv("SCREENING_US_TARGET_DATE", "").strip()
+    target_date = date.fromisoformat(target_raw) if target_raw else None
+    actual_universe_source = "provided"
     if tickers is None:
-        tickers = fetch_us_universe(universe_source)
+        if target_date is not None and universe_source == "auto":
+            for source in ("sp500", "env", "default"):
+                try:
+                    tickers = fetch_us_universe(source)
+                    if source == "sp500" and len(set(tickers)) < 400:
+                        raise RuntimeError("S&P 500 universe is incomplete")
+                    if tickers:
+                        actual_universe_source = source
+                        break
+                except Exception as exc:
+                    logger.warning("US universe %s unavailable: %s", source, exc)
+        else:
+            tickers = fetch_us_universe(universe_source)
+            actual_universe_source = universe_source
+
+    if not tickers:
+        raise RuntimeError("US universe is empty")
 
     logger.info("Fetching US snapshot for %d tickers", len(tickers))
 
@@ -125,11 +147,21 @@ def fetch_us_snapshot(
             if len(hist) < 2:
                 return None
 
+            if target_date is not None and pd.Timestamp(hist.index[-1]).date() != target_date:
+                logger.warning("US snapshot %s has no closing data for %s", ticker, target_date)
+                return None
+
             latest = hist.iloc[-1]
             prev = hist.iloc[-2]
             price = float(latest["Close"])
             prev_close = float(prev["Close"])
             volume = float(latest["Volume"])
+            if target_date is not None and (
+                not math.isfinite(price) or price <= 0
+                or not math.isfinite(prev_close) or prev_close <= 0
+                or not math.isfinite(volume) or volume <= 0
+            ):
+                return None
             change_pct = ((price - prev_close) / prev_close * 100) if prev_close > 0 else 0.0
 
             vol_20d = float(hist["Volume"].tail(20).mean())
@@ -138,6 +170,8 @@ def fetch_us_snapshot(
             info = yf.Ticker(ticker).fast_info
             market_cap = getattr(info, "market_cap", None) or 0
             shares = getattr(info, "shares", None) or 0
+            if target_date is not None and (not math.isfinite(float(market_cap)) or float(market_cap) <= 0):
+                return None
             turnover_rate = (volume / shares * 100) if shares > 0 else 0.0
 
             return {
@@ -168,6 +202,11 @@ def fetch_us_snapshot(
     if not rows:
         raise RuntimeError("yfinance returned no valid data for any ticker")
 
+    if target_date is not None and len(rows) < math.ceil(len(tickers) * 0.8):
+        raise RuntimeError(
+            f"US snapshot coverage {len(rows)}/{len(tickers)} is below 80% for {target_date}"
+        )
+
     df = pd.DataFrame(rows)
 
     numeric_cols = [
@@ -181,9 +220,17 @@ def fetch_us_snapshot(
     df = df.dropna(subset=["price"])
     df = df[df["price"] > 0]
 
-    _enrich_info_fields(df)
+    if target_date is None:
+        _enrich_info_fields(df)
+    else:
+        # This automatic strategy excludes valuation factors; hundreds of
+        # sequential info requests are slow and commonly rate-limited.
+        logger.info("US automated snapshot skips valuation enrichment")
 
-    df.attrs["snapshot_source"] = "yfinance"
+    df.attrs["snapshot_source"] = (
+        f"yfinance/{actual_universe_source}: {len(rows)}/{len(tickers)}"
+        if target_date is not None else "yfinance"
+    )
     logger.info("US snapshot: %d rows from yfinance", len(df))
     return df
 

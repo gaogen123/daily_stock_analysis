@@ -3,7 +3,7 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -16,6 +16,101 @@ spec.loader.exec_module(screening)
 
 
 class ScreeningReportTests(unittest.TestCase):
+    def test_us_session_uses_new_york_date_and_skips_holiday(self):
+        # Friday 22:30 UTC is already Saturday morning in Beijing.
+        now = datetime(2026, 11, 13, 22, 30, tzinfo=timezone.utc)
+        dates = [date(2026, 11, 12), date(2026, 11, 13)]
+        close = lambda d: datetime(d.year, d.month, d.day, 21, tzinfo=timezone.utc)
+        self.assertEqual(screening.select_us_session(now, dates, close, False), date(2026, 11, 13))
+        holiday = datetime(2026, 11, 26, 22, 30, tzinfo=timezone.utc)
+        self.assertIsNone(screening.select_us_session(holiday, [date(2026, 11, 25)], close, False))
+        self.assertEqual(screening.select_us_session(holiday, [date(2026, 11, 25)], close, True), date(2026, 11, 25))
+
+    def test_us_before_close_fails_or_explicit_force_uses_previous_session(self):
+        now = datetime(2026, 11, 13, 14, 0, tzinfo=timezone.utc)
+        dates = [date(2026, 11, 12), date(2026, 11, 13)]
+        close = lambda d: datetime(d.year, d.month, d.day, 21, tzinfo=timezone.utc)
+        with self.assertRaises(RuntimeError):
+            screening.select_us_session(now, dates, close, False)
+        self.assertEqual(screening.select_us_session(now, dates, close, True), date(2026, 11, 12))
+        with self.assertRaises(RuntimeError):
+            screening.select_us_session(now, None, close, False)
+
+    def test_us_tickers_do_not_merge_class_shares_or_allow_invalid_symbols(self):
+        result = {"snapshot_count": 490, "candidates": [{"code": "AAPL"}, {"code": "BRK-B"}, {"code": "BF.B"}]}
+        candidates = screening.validated_candidates(result, "us")
+        supported, excluded = screening.supported_us_candidates(candidates)
+        self.assertEqual([c["code"] for c in supported], ["AAPL"])
+        self.assertEqual(excluded, ["BRK-B", "BF.B"])
+        self.assertTrue(screening.has_candidate_reports("## Apple (AAPL)\n分析正文", supported))
+        with self.assertRaises(ValueError):
+            screening.validated_candidates({"snapshot_count": 490, "candidates": [{"code": "AAPL;BAD"}]}, "us")
+        with self.assertRaises(ValueError):
+            screening.validated_candidates({"snapshot_count": 2, "candidates": []}, "us")
+        with self.assertRaises(ValueError):
+            screening.supported_us_candidates([{"code": "BRK-B"}])
+
+    def test_us_summary_discloses_source_and_missing_valuation(self):
+        result = {"snapshot_count": 40, "snapshot_source": "yfinance/default: 40/49"}
+        summary = screening.screening_summary(result, [{"code": "AAPL", "name": "Apple"}], "2026-11-12", "us", ["BRK-B"])
+        self.assertIn("美东最近已收盘交易日", summary)
+        self.assertIn("40/49", summary)
+        self.assertIn("备用池", summary)
+        self.assertIn("BRK-B", summary)
+        self.assertIn("未采集 PE/PB", summary)
+
+    def test_us_force_uses_completed_ny_session_and_shanghai_report_filename(self):
+        instant = datetime(2026, 11, 13, 14, 0, tzinfo=timezone.utc)
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+        calls = []
+
+        class FakeCalendar:
+            def session_close(self, day):
+                return datetime(day.year, day.month, day.day, 21, tzinfo=timezone.utc)
+
+        class FakeService:
+            def __init__(self, config):
+                pass
+            def screen(self, **kwargs):
+                calls.append(kwargs)
+                return {"snapshot_count": 400, "snapshot_source": "yfinance/sp500: 400/500", "candidates": [{"code": "AAPL"}, {"code": "BRK-B"}]}
+
+        class FakeSender:
+            def __init__(self, config):
+                pass
+            def send_to_email(self, content, subject):
+                calls.append((content, subject))
+                return True
+
+        modules = {
+            "src.config": types.SimpleNamespace(get_config=lambda: object()),
+            "src.core.trading_calendar": types.SimpleNamespace(get_trading_dates=lambda *args: [date(2026, 11, 12), date(2026, 11, 13)]),
+            "src.services.screening_service": types.SimpleNamespace(ScreeningService=FakeService),
+            "src.notification_sender.email_sender": types.SimpleNamespace(EmailSender=FakeSender),
+            "exchange_calendars": types.SimpleNamespace(get_calendar=lambda *args: FakeCalendar()),
+        }
+        with tempfile.TemporaryDirectory() as directory, patch.object(screening, "ROOT", Path(directory)), \
+             patch.object(screening, "datetime", FrozenDateTime), patch.dict(sys.modules, modules), \
+             patch.object(screening.os, "chdir"), \
+             patch.dict(screening.os.environ, {"SCREENING_MARKET": "us", "SCREENING_FORCE_RUN": "true"}):
+            def analyze(command, **kwargs):
+                self.assertEqual(command[command.index("--stocks") + 1], "AAPL")
+                self.assertIn("--force-run", command)
+                self.assertEqual(screening.os.environ["SCREENING_US_TARGET_DATE"], "2026-11-12")
+                (Path(directory) / "reports" / "report_20261113.md").write_text("## Apple (AAPL)\n分析正文", encoding="utf-8")
+            with patch.object(screening.subprocess, "run", side_effect=analyze):
+                self.assertEqual(screening.main(), 0)
+            self.assertEqual(calls[0]["strategy"], "us_balanced")
+            self.assertEqual(calls[0]["market"], "us")
+            self.assertIn("BRK-B", calls[1][0])
+            self.assertIn("2026-11-12", calls[1][1])
+            self.assertTrue((Path(directory) / "reports" / "screening_us_20261112.md").is_file())
+
     def test_empty_is_valid_only_for_nonempty_market_snapshot(self):
         self.assertEqual(screening.validated_candidates({"snapshot_count": 100, "candidates": []}), [])
         with self.assertRaises(ValueError):

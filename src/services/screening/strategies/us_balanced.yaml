@@ -1,0 +1,36 @@
+# US equities: use liquid, larger names and avoid valuation hard filters when
+# upstream does not provide PE/PB. Prices and turnover are in USD.
+name: us_balanced
+display_name: 美股稳健多因子
+description: 以流动性、动量和稳定性为基础筛选美股候选；估值字段可能缺失
+version: "1.0"
+category: framework
+tags: [multi_factor, balanced, us]
+analysis_skills: [bull_trend]
+style:
+  risk_profile: balanced
+  holding_period: watchlist
+  execution_style: multi_factor
+  market_regime: [neutral, rotation]
+  capital_profile: medium_liquidity
+  ui_badge: 多因子
+screening:
+  enabled: true
+  market_scope: [us]
+  hard_filters:
+    exclude_st: false
+    price_min: 5
+    amount_min: 20000000
+    market_cap_min: 2000000000
+    change_pct_min: -8
+    change_pct_max: 8
+  factor_weights:
+    liquidity: 0.28
+    momentum: 0.22
+    activity: 0.14
+    stability: 0.26
+    size: 0.10
+  risk_profile:
+    chase_change_pct: 7.0
+    abnormal_volume_ratio: 5.0
+  max_output: 5
