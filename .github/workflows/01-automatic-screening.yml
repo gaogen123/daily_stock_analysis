@@ -1,0 +1,53 @@
+name: A股自动选股与邮件报告
+
+on:
+  schedule:
+    - cron: '0 10 * * 1-5' # 北京时间工作日 18:00
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 非交易日也运行一次
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automatic-stock-screening
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: Asia/Shanghai
+      SCREENING_ENABLED: 'true'
+      SCREENING_FORCE_RUN: ${{ inputs.force_run || 'false' }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || 'false' }}
+      SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || 'false' }}
+      TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+      TICKPLUS_API_KEY: ${{ secrets.TICKPLUS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 自动选股并发送邮件
+        run: python scripts/automatic_screening.py
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: screening-reports-${{ github.run_number }}
+          path: reports/screening_*.md
+          if-no-files-found: ignore
+          retention-days: 30
